@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Websocket.Client.Net", "src\Websocket.Client.Net\Websocket.Client.Net.csproj", "{F49F621C-3243-48B5-A42A-AEC8136D7B90}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Websocket.Client.Net.Sample", "samples\Websocket.Client.Net.Sample\Websocket.Client.Net.Sample.csproj", "{DCA901B0-6B2F-4370-B30B-BEFC997AD516}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Websocket.Client.Net.IntegrationTests", "tests\Websocket.Client.Net.IntegrationTests\Websocket.Client.Net.IntegrationTests.csproj", "{C877C7D5-AD4A-40D7-98CB-603641401466}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F49F621C-3243-48B5-A42A-AEC8136D7B90}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F49F621C-3243-48B5-A42A-AEC8136D7B90}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F49F621C-3243-48B5-A42A-AEC8136D7B90}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F49F621C-3243-48B5-A42A-AEC8136D7B90}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DCA901B0-6B2F-4370-B30B-BEFC997AD516}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DCA901B0-6B2F-4370-B30B-BEFC997AD516}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DCA901B0-6B2F-4370-B30B-BEFC997AD516}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DCA901B0-6B2F-4370-B30B-BEFC997AD516}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C877C7D5-AD4A-40D7-98CB-603641401466}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C877C7D5-AD4A-40D7-98CB-603641401466}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C877C7D5-AD4A-40D7-98CB-603641401466}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C877C7D5-AD4A-40D7-98CB-603641401466}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
