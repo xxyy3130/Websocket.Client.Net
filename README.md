@@ -1,8 +1,8 @@
 # Websocket.Client.Net
 
-面向 .NET 8 的原生 WebSocket Client 类库。仅使用 BCL 的 `ClientWebSocket`，没有第三方运行时依赖；原生支持 `ws://`、`wss://`、Header、Cookie、事件通知与自动重连。
+A native WebSocket client library for .NET 8. It uses only the BCL `ClientWebSocket` with no third-party runtime dependencies, and provides built-in support for `ws://`, `wss://`, headers, cookies, event notifications, and automatic reconnection.
 
-## 快速使用
+## Quick Start
 
 ```csharp
 using Websocket.Client.Net;
@@ -10,7 +10,7 @@ using Websocket.Client.Net;
 await using var ws = new WebSocketClient("wss://example.com/ws", new WebSocketClientOptions
 {
     AutoReconnect = true,
-    MaxReconnectAttempts = 10,             // -1 表示无限重试
+    MaxReconnectAttempts = 10,             // -1 means unlimited retries
     ReconnectDelay = TimeSpan.FromSeconds(1)
 });
 
@@ -20,7 +20,7 @@ ws.SetCookie("session", "cookie-value");
 
 ws.OnOpen += (sender, e) =>
 {
-    Console.WriteLine(e.IsReconnect ? "重连成功" : "连接成功");
+    Console.WriteLine(e.IsReconnect ? "Reconnected" : "Connected");
 };
 
 ws.OnMessage += (sender, e) =>
@@ -43,7 +43,7 @@ ws.OnClose += (sender, e) =>
 
 ws.OnReconnecting += (sender, e) =>
 {
-    Console.WriteLine($"第 {e.Attempt} 次重连，等待 {e.Delay}");
+    Console.WriteLine($"Reconnect attempt {e.Attempt}; waiting {e.Delay}");
 };
 
 await ws.ConnectAsync();
@@ -51,7 +51,7 @@ await ws.SendAsync("hello");
 await ws.DisconnectAsync(reason: "shutdown");
 ```
 
-二进制发送提供明确重载，全部支持 `CancellationToken`：
+Binary sending provides explicit overloads, all of which support `CancellationToken`:
 
 ```csharp
 await ws.SendAsync(byteArray, cancellationToken: cancellationToken);
@@ -59,16 +59,16 @@ await ws.SendAsync(arraySegment, cancellationToken: cancellationToken);
 await ws.SendAsync(readOnlySequence, cancellationToken: cancellationToken);
 ```
 
-`ConnectAsync(cancellationToken)` 的 Token 取消当前调用者的等待，不会取消其他调用者共享的连接或重连流程。发送 Token 若在原生发送开始后取消，当前物理连接会中止，避免后续消息接在不完整的 WebSocket 消息后面；启用自动重连时会建立干净的新连接。
+The token passed to `ConnectAsync(cancellationToken)` cancels only the current caller's wait; it does not cancel the connection or reconnection flow shared by other callers. If a send token is canceled after a native send has started, the current physical connection is aborted so that later messages cannot follow an incomplete WebSocket message. When automatic reconnection is enabled, a clean new connection is established.
 
-## 吞吐优先的零拷贝接收
+## Throughput-First Zero-Copy Receiving
 
-`OnMessage` 为了保证事件返回后数据仍然有效，会为每条完整消息创建一份稳定的 `byte[]`。吞吐敏感路径可改用 `MessageReceivedAsync`；传入的内存来自池，只能在回调完成前使用：
+To keep data valid after an event handler returns, `OnMessage` creates a stable `byte[]` for each complete message. Throughput-sensitive paths can use `MessageReceivedAsync` instead. The supplied memory comes from a pool and may only be used until the callback completes:
 
 ```csharp
 ws.MessageReceivedAsync = async (sender, message, type, cancellationToken) =>
 {
     await processor.ProcessAsync(message, cancellationToken);
-    // 不要把 message 保存到回调之外；需要保留时请调用 message.ToArray()。
+    // Do not retain message beyond the callback; call message.ToArray() if needed.
 };
 ```
