@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <PackageId>Websocket.Client.Net</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Websocket.Client.Net contributors</Authors>
+    <Description>A high-performance, dependency-free WebSocket client for .NET 8.</Description>
+    <PackageTags>websocket;client;wss;reconnect;net8</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/xxyy3130/Websocket.Client.Net</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/xxyy3130/Websocket.Client.Net.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
