@@ -7,7 +7,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <PackageId>Websocket.Client.Net</PackageId>
-    <Version>0.0.1</Version>
+    <Version>0.0.2</Version>
     <Authors>Websocket.Client.Net contributors</Authors>
     <Description>A high-performance, dependency-free WebSocket client for .NET 8.</Description>
     <PackageTags>websocket;client;wss;reconnect;net8</PackageTags>

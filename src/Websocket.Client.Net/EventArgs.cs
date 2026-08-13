@@ -80,7 +80,8 @@ public sealed class ReconnectingEventArgs(
 }
 
 /// <summary>
-/// Allocation-free receive callback. The message memory is valid only until the returned ValueTask completes.
+/// Concurrent allocation-free receive callback. The message memory is valid only until the returned
+/// ValueTask completes. Separate invocations may overlap and complete out of order.
 /// </summary>
 public delegate ValueTask AsyncMessageHandler(
     WebSocketClient sender,

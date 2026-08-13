@@ -8,6 +8,7 @@ namespace Websocket.Client.Net;
 /// <summary>
 /// A dependency-free .NET 8 WebSocket client with event-based messages and automatic reconnect.
 /// One receive and one send may run concurrently; concurrent sends are serialized internally.
+/// Event occurrences are dispatched independently and may overlap or complete out of order.
 /// </summary>
 public sealed class WebSocketClient : IDisposable, IAsyncDisposable
 {
@@ -18,7 +19,8 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
     private readonly string[] _subProtocols;
     private readonly object _sync = new();
     private readonly SemaphoreSlim _sendGate = new(1, 1);
-    private readonly AsyncLocal<bool> _insideUserCallback = new();
+    private readonly List<CancellationTokenSource> _retiredLifetimeSources = [];
+    private readonly int _maxMessageSize;
 
     private ClientWebSocket? _socket;
     private CancellationTokenSource? _lifetimeCts;
@@ -28,6 +30,7 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
     private volatile bool _manualStop;
     private WebSocketCloseStatus _requestedCloseStatus = WebSocketCloseStatus.NormalClosure;
     private string? _requestedCloseReason;
+    private int _activeAsyncMessageHandlers;
     private int _disposed;
 
     public WebSocketClient(string url, WebSocketClientOptions? options = null)
@@ -45,6 +48,7 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
 
         _options = options ?? new WebSocketClientOptions();
         _options.Validate();
+        _maxMessageSize = checked((int)_options.MaxMessageSize);
         _uri = uri;
         _headers = _options.Headers is null
             ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -63,8 +67,9 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
     public event EventHandler<ReconnectingEventArgs>? OnReconnecting;
 
     /// <summary>
-    /// Optional zero-copy alternative to OnMessage. The memory is pooled and valid only until
-    /// the returned ValueTask completes. If OnMessage is also subscribed, its stable copy is still created.
+    /// Optional concurrent zero-copy alternative to OnMessage. The memory is pooled and valid only
+    /// until the returned ValueTask completes. Each message is dispatched independently, so callbacks
+    /// may overlap and complete out of order. If OnMessage is also subscribed, its stable copy is still created.
     /// </summary>
     public AsyncMessageHandler? MessageReceivedAsync { get; set; }
 
@@ -386,13 +391,28 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
         finally
         {
             TaskCompletionSource<bool> terminalSignal;
+            List<CancellationTokenSource>? sourcesToDispose = null;
             lock (_sync)
             {
                 terminalSignal = _openSignal;
                 _socket = null;
                 _lifecycleTask = null;
-                _lifetimeCts?.Dispose();
+                var lifetimeSource = _lifetimeCts;
                 _lifetimeCts = null;
+                if (lifetimeSource is not null)
+                {
+                    if (Volatile.Read(ref _activeAsyncMessageHandlers) == 0)
+                    {
+                        sourcesToDispose = [.. _retiredLifetimeSources, lifetimeSource];
+                        _retiredLifetimeSources.Clear();
+                    }
+                    else
+                    {
+                        // A concurrent MessageReceivedAsync callback may still register with its token.
+                        // Retain the source until every outstanding callback has completed.
+                        _retiredLifetimeSources.Add(lifetimeSource);
+                    }
+                }
                 if (Volatile.Read(ref _disposed) == 0)
                     SetState(WebSocketClientState.Disconnected);
             }
@@ -405,6 +425,12 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
                     terminalSignal.TrySetException(terminalError);
                 else
                     terminalSignal.TrySetCanceled(lifetimeToken);
+            }
+
+            if (sourcesToDispose is not null)
+            {
+                foreach (var source in sourcesToDispose)
+                    source.Dispose();
             }
         }
     }
@@ -495,7 +521,7 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
 
                 if (messageBuffer is null && result.EndOfMessage)
                 {
-                    if (result.Count > _options.MaxMessageSize)
+                    if (result.Count > _maxMessageSize)
                     {
                         await TryCloseOutputAsync(
                             socket,
@@ -505,16 +531,21 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
                         throw new WebSocketMessageTooBigException(_options.MaxMessageSize);
                     }
 
-                    await DispatchMessageAsync(
-                        receiveBuffer.AsMemory(0, result.Count),
-                        result.MessageType,
-                        cancellationToken).ConfigureAwait(false);
+                    // Transfer this pooled buffer to the callback and immediately rent the next one.
+                    // This keeps the common single-frame path zero-copy without blocking ReceiveAsync.
+                    var nextReceiveBuffer = ArrayPool<byte>.Shared.Rent(_options.ReceiveBufferSize);
+                    var completedMessage = PooledMessageBuffer.TakeOwnership(
+                        receiveBuffer,
+                        result.Count,
+                        _maxMessageSize);
+                    receiveBuffer = nextReceiveBuffer;
+                    DispatchMessage(completedMessage, result.MessageType, cancellationToken);
                     continue;
                 }
 
                 messageBuffer ??= new PooledMessageBuffer(
-                    Math.Min(_options.ReceiveBufferSize, checked((int)_options.MaxMessageSize)),
-                    checked((int)_options.MaxMessageSize));
+                    Math.Min(_options.ReceiveBufferSize, _maxMessageSize),
+                    _maxMessageSize);
 
                 try
                 {
@@ -533,12 +564,9 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
                 if (!result.EndOfMessage)
                     continue;
 
-                await DispatchMessageAsync(
-                    messageBuffer.WrittenMemory,
-                    result.MessageType,
-                    cancellationToken).ConfigureAwait(false);
-                messageBuffer.Dispose();
+                var reassembledMessage = messageBuffer;
                 messageBuffer = null;
+                DispatchMessage(reassembledMessage, result.MessageType, cancellationToken);
             }
 
             throw new OperationCanceledException(cancellationToken);
@@ -550,37 +578,35 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
         }
     }
 
-    private async ValueTask DispatchMessageAsync(
-        ReadOnlyMemory<byte> message,
+    private void DispatchMessage(
+        PooledMessageBuffer message,
         WebSocketMessageType messageType,
         CancellationToken cancellationToken)
     {
         var asyncHandler = MessageReceivedAsync;
-        if (asyncHandler is not null)
+        var eventHandler = OnMessage;
+        var messageOwnershipTransferred = false;
+
+        try
         {
-            var previous = _insideUserCallback.Value;
-            _insideUserCallback.Value = true;
-            try
+            if (eventHandler is not null)
             {
-                await asyncHandler(this, message, messageType, cancellationToken).ConfigureAwait(false);
+                // OnMessage data may be retained indefinitely, so it owns a stable copy.
+                var args = new MessageEventArgs(message.WrittenMemory.ToArray(), messageType);
+                QueueUserEvent(eventHandler, args, "OnMessage handler");
             }
-            catch (Exception exception)
+
+            if (asyncHandler is not null)
             {
-                RaiseError(exception, "MessageReceivedAsync handler", willReconnect: false);
-            }
-            finally
-            {
-                _insideUserCallback.Value = previous;
+                QueueAsyncMessageHandler(asyncHandler, message, messageType, cancellationToken);
+                messageOwnershipTransferred = true;
             }
         }
-
-        var eventHandler = OnMessage;
-        if (eventHandler is null)
-            return;
-
-        // Event consumers may retain data, so the event surface intentionally owns one stable copy.
-        var args = new MessageEventArgs(message.ToArray(), messageType);
-        InvokeUserEvent(() => eventHandler(this, args), "OnMessage handler");
+        finally
+        {
+            if (!messageOwnershipTransferred)
+                message.Dispose();
+        }
     }
 
     private async ValueTask SendTextCoreAsync(string text, CancellationToken cancellationToken)
@@ -739,10 +765,6 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
             TryCancel(lifetime);
         }
 
-        // Calling Close from an event/callback must not wait on the lifecycle that is invoking it.
-        if (_insideUserCallback.Value)
-            return;
-
         await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -806,7 +828,7 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
     {
         var handler = OnOpen;
         if (handler is not null)
-            InvokeUserEvent(() => handler(this, new OpenEventArgs(isReconnect)), "OnOpen handler");
+            QueueUserEvent(handler, new OpenEventArgs(isReconnect), "OnOpen handler");
     }
 
     private void RaiseClose(
@@ -817,8 +839,9 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
     {
         var handler = OnClose;
         if (handler is not null)
-            InvokeUserEvent(
-                () => handler(this, new CloseEventArgs(code, reason, wasClean, willReconnect)),
+            QueueUserEvent(
+                handler,
+                new CloseEventArgs(code, reason, wasClean, willReconnect),
                 "OnClose handler");
     }
 
@@ -826,12 +849,13 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
     {
         var handler = OnReconnecting;
         if (handler is not null)
-            InvokeUserEvent(
-                () => handler(this, new ReconnectingEventArgs(
+            QueueUserEvent(
+                handler,
+                new ReconnectingEventArgs(
                     attempt,
                     _options.MaxReconnectAttempts,
                     delay,
-                    cause)),
+                    cause),
                 "OnReconnecting handler");
     }
 
@@ -841,37 +865,133 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
         if (handler is null)
             return;
 
-        var previous = _insideUserCallback.Value;
-        _insideUserCallback.Value = true;
+        var workItem = new ErrorEventWorkItem(
+            this,
+            handler,
+            new ErrorEventArgs(exception, operation, willReconnect));
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static item => item.Client.InvokeErrorHandler(item.Handler, item.Args),
+            workItem,
+            preferLocal: false);
+    }
+
+    private void QueueAsyncMessageHandler(
+        AsyncMessageHandler handler,
+        PooledMessageBuffer message,
+        WebSocketMessageType messageType,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _activeAsyncMessageHandlers);
+        var workItem = new AsyncMessageWorkItem(
+            this,
+            handler,
+            message,
+            messageType,
+            cancellationToken);
+
+        if (ThreadPool.UnsafeQueueUserWorkItem(
+            static item => _ = item.Client.InvokeAsyncMessageHandlerAsync(item),
+            workItem,
+            preferLocal: false))
+        {
+            return;
+        }
+
+        message.Dispose();
+        ReleaseAsyncMessageHandler();
+        RaiseError(
+            new InvalidOperationException("Unable to queue MessageReceivedAsync handler."),
+            "MessageReceivedAsync dispatch",
+            willReconnect: false);
+    }
+
+    private async Task InvokeAsyncMessageHandlerAsync(AsyncMessageWorkItem workItem)
+    {
+        using (workItem.Message)
+        {
+            try
+            {
+                await workItem.Handler(
+                    this,
+                    workItem.Message.WrittenMemory,
+                    workItem.MessageType,
+                    workItem.CancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (workItem.CancellationToken.IsCancellationRequested)
+            {
+                // Canceling the connection lifetime is a normal callback termination path.
+            }
+            catch (Exception exception)
+            {
+                RaiseError(exception, "MessageReceivedAsync handler", willReconnect: false);
+            }
+            finally
+            {
+                ReleaseAsyncMessageHandler();
+            }
+        }
+    }
+
+    private void ReleaseAsyncMessageHandler()
+    {
+        if (Interlocked.Decrement(ref _activeAsyncMessageHandlers) != 0)
+            return;
+
+        List<CancellationTokenSource>? sourcesToDispose = null;
+        lock (_sync)
+        {
+            if (Volatile.Read(ref _activeAsyncMessageHandlers) == 0 && _retiredLifetimeSources.Count > 0)
+            {
+                sourcesToDispose = [.. _retiredLifetimeSources];
+                _retiredLifetimeSources.Clear();
+            }
+        }
+
+        if (sourcesToDispose is null)
+            return;
+
+        foreach (var source in sourcesToDispose)
+            source.Dispose();
+    }
+
+    private void QueueUserEvent<TEventArgs>(
+        EventHandler<TEventArgs> handler,
+        TEventArgs args,
+        string operation)
+        where TEventArgs : EventArgs
+    {
+        var workItem = new EventWorkItem<TEventArgs>(this, handler, args, operation);
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static item => item.Client.InvokeUserEvent(item.Handler, item.Args, item.Operation),
+            workItem,
+            preferLocal: false);
+    }
+
+    private void InvokeErrorHandler(EventHandler<ErrorEventArgs> handler, ErrorEventArgs args)
+    {
         try
         {
-            handler(this, new ErrorEventArgs(exception, operation, willReconnect));
+            handler(this, args);
         }
         catch
         {
             // Error handlers must never tear down the transport or recurse into OnError.
         }
-        finally
-        {
-            _insideUserCallback.Value = previous;
-        }
     }
 
-    private void InvokeUserEvent(Action action, string operation)
+    private void InvokeUserEvent<TEventArgs>(
+        EventHandler<TEventArgs> handler,
+        TEventArgs args,
+        string operation)
+        where TEventArgs : EventArgs
     {
-        var previous = _insideUserCallback.Value;
-        _insideUserCallback.Value = true;
         try
         {
-            action();
+            handler(this, args);
         }
         catch (Exception exception)
         {
             RaiseError(exception, operation, willReconnect: false);
-        }
-        finally
-        {
-            _insideUserCallback.Value = previous;
         }
     }
 
@@ -973,6 +1093,25 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
         string? Reason,
         bool WasClean);
 
+    private readonly record struct EventWorkItem<TEventArgs>(
+        WebSocketClient Client,
+        EventHandler<TEventArgs> Handler,
+        TEventArgs Args,
+        string Operation)
+        where TEventArgs : EventArgs;
+
+    private readonly record struct ErrorEventWorkItem(
+        WebSocketClient Client,
+        EventHandler<ErrorEventArgs> Handler,
+        ErrorEventArgs Args);
+
+    private readonly record struct AsyncMessageWorkItem(
+        WebSocketClient Client,
+        AsyncMessageHandler Handler,
+        PooledMessageBuffer Message,
+        WebSocketMessageType MessageType,
+        CancellationToken CancellationToken);
+
     private sealed class PooledMessageBuffer : IDisposable
     {
         private readonly int _maximumLength;
@@ -984,6 +1123,18 @@ public sealed class WebSocketClient : IDisposable, IAsyncDisposable
             _maximumLength = maximumLength;
             _buffer = ArrayPool<byte>.Shared.Rent(initialLength);
         }
+
+        private PooledMessageBuffer(byte[] buffer, int length, int maximumLength)
+        {
+            _maximumLength = maximumLength;
+            _buffer = buffer;
+            _length = length;
+        }
+
+        public static PooledMessageBuffer TakeOwnership(
+            byte[] buffer,
+            int length,
+            int maximumLength) => new(buffer, length, maximumLength);
 
         public ReadOnlyMemory<byte> WrittenMemory =>
             (_buffer ?? throw new ObjectDisposedException(nameof(PooledMessageBuffer))).AsMemory(0, _length);
