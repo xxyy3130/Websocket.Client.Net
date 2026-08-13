@@ -1,17 +1,27 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using Websocket.Client.Net;
+
+if (args.Contains("--dispatch-only", StringComparer.Ordinal))
+{
+    await TestConcurrentDispatchCoreAsync();
+    Console.WriteLine("Concurrent dispatch core test passed.");
+    return;
+}
 
 Console.WriteLine("Starting the in-process WebSocket test server...");
 await using var server = new LocalWebSocketServer();
 Console.WriteLine("Test server started.");
 
 await TestEventsHeadersCookiesAndConcurrentSendAsync(server.BaseUri);
+await TestConcurrentMessageDispatchAsync(server.BaseUri);
 await TestSendErrorHandlerCanDisposeAsync(server.BaseUri);
 await TestAutomaticReconnectAsync(server);
 await TestConnectFromCloseEventAsync(server);
@@ -19,6 +29,75 @@ await TestConnectCancellationAsync(server.BaseUri);
 await TestConcurrentConnectCancellationIsolationAsync(server);
 await TestDisconnectCancellationAsync(server.BaseUri);
 Console.WriteLine("All Websocket.Client.Net integration tests passed.");
+
+static async Task TestConcurrentDispatchCoreAsync()
+{
+    await using var client = new WebSocketClient("ws://127.0.0.1:1", new WebSocketClientOptions
+    {
+        AutoReconnect = false
+    });
+
+    var releaseHandlers = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var asyncHandlersEntered = 0;
+    var eventHandlersEntered = 0;
+    var asyncHandlersCompleted = 0;
+    var eventHandlersCompleted = 0;
+    var twoAsyncHandlersEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var twoEventHandlersEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var asyncHandlersDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var eventHandlersDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    client.MessageReceivedAsync = async (_, message, type, cancellationToken) =>
+    {
+        Assert(type == WebSocketMessageType.Text, "Concurrent callback must receive a text message.");
+        var textBeforeAwait = Encoding.UTF8.GetString(message.Span);
+        if (Interlocked.Increment(ref asyncHandlersEntered) == 2)
+            twoAsyncHandlersEntered.TrySetResult(true);
+
+        await releaseHandlers.Task.WaitAsync(cancellationToken);
+
+        Assert(Encoding.UTF8.GetString(message.Span) == textBeforeAwait,
+            "Pooled memory must remain stable until its concurrent callback completes.");
+        if (Interlocked.Increment(ref asyncHandlersCompleted) == 2)
+            asyncHandlersDone.TrySetResult(true);
+    };
+
+    client.OnMessage += (_, e) =>
+    {
+        var textBeforeWait = e.Text;
+        if (Interlocked.Increment(ref eventHandlersEntered) == 2)
+            twoEventHandlersEntered.TrySetResult(true);
+
+        releaseHandlers.Task.GetAwaiter().GetResult();
+
+        Assert(e.Text == textBeforeWait, "OnMessage must own stable data during concurrent dispatch.");
+        if (Interlocked.Increment(ref eventHandlersCompleted) == 2)
+            eventHandlersDone.TrySetResult(true);
+    };
+
+    var clientType = typeof(WebSocketClient);
+    var pooledMessageType = clientType.GetNestedType("PooledMessageBuffer", BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("PooledMessageBuffer was not found.");
+    var takeOwnership = pooledMessageType.GetMethod("TakeOwnership", BindingFlags.Public | BindingFlags.Static)
+        ?? throw new InvalidOperationException("TakeOwnership was not found.");
+    var dispatchMessage = clientType.GetMethod("DispatchMessage", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("DispatchMessage was not found.");
+
+    foreach (var text in new[] { "concurrent-1", "concurrent-2" })
+    {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        var rented = ArrayPool<byte>.Shared.Rent(bytes.Length);
+        bytes.CopyTo(rented, 0);
+        var owner = takeOwnership.Invoke(null, [rented, bytes.Length, 1024])
+            ?? throw new InvalidOperationException("Unable to create pooled message owner.");
+        dispatchMessage.Invoke(client, [owner, WebSocketMessageType.Text, CancellationToken.None]);
+    }
+
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    await Task.WhenAll(twoAsyncHandlersEntered.Task, twoEventHandlersEntered.Task).WaitAsync(timeout.Token);
+    releaseHandlers.TrySetResult(true);
+    await Task.WhenAll(asyncHandlersDone.Task, eventHandlersDone.Task).WaitAsync(timeout.Token);
+}
 
 static async Task TestEventsHeadersCookiesAndConcurrentSendAsync(Uri baseUri)
 {
@@ -32,20 +111,27 @@ static async Task TestEventsHeadersCookiesAndConcurrentSendAsync(Uri baseUri)
     client.SetCookie("session", "cookie-value");
 
     var openCount = 0;
+    var opened = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     var received = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     var messages = 0;
-    var binaryMessages = new List<byte[]>();
+    var binaryMessages = new ConcurrentBag<byte[]>();
     var binariesReceived = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     var closeCount = 0;
     CloseEventArgs? closeArgs = null;
-    var errors = new List<Exception>();
+    var closed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var errors = new ConcurrentQueue<Exception>();
 
-    client.OnOpen += (_, _) => Interlocked.Increment(ref openCount);
-    client.OnError += (_, e) => errors.Add(e.Exception);
+    client.OnOpen += (_, _) =>
+    {
+        Interlocked.Increment(ref openCount);
+        opened.TrySetResult(true);
+    };
+    client.OnError += (_, e) => errors.Enqueue(e.Exception);
     client.OnClose += (_, e) =>
     {
         closeArgs = e;
         Interlocked.Increment(ref closeCount);
+        closed.TrySetResult(true);
     };
     client.OnMessage += (_, e) =>
     {
@@ -70,6 +156,7 @@ static async Task TestEventsHeadersCookiesAndConcurrentSendAsync(Uri baseUri)
     await Task.WhenAll(Enumerable.Range(0, 32)
         .Select(index => client.SendAsync($"message-{index}", timeout.Token).AsTask()));
     await received.Task.WaitAsync(timeout.Token);
+    await opened.Task.WaitAsync(timeout.Token);
 
     Assert(openCount == 1, "OnOpen must fire exactly once.");
     Assert(messages == 32, "All concurrent sends must be echoed.");
@@ -83,9 +170,12 @@ static async Task TestEventsHeadersCookiesAndConcurrentSendAsync(Uri baseUri)
     await client.SendAsync(sequence, cancellationToken: timeout.Token);
     await binariesReceived.Task.WaitAsync(timeout.Token);
 
-    Assert(binaryMessages[0].SequenceEqual(new byte[] { 1, 2, 3 }), "byte[] send must preserve data.");
-    Assert(binaryMessages[1].SequenceEqual(new byte[] { 4, 5, 6 }), "ArraySegment send must honor offset and count.");
-    Assert(binaryMessages[2].SequenceEqual(new byte[] { 7, 8, 9, 10 }), "ReadOnlySequence send must remain one message.");
+    Assert(binaryMessages.Any(message => message.SequenceEqual(new byte[] { 1, 2, 3 })),
+        "byte[] send must preserve data.");
+    Assert(binaryMessages.Any(message => message.SequenceEqual(new byte[] { 4, 5, 6 })),
+        "ArraySegment send must honor offset and count.");
+    Assert(binaryMessages.Any(message => message.SequenceEqual(new byte[] { 7, 8, 9, 10 })),
+        "ReadOnlySequence send must remain one message.");
 
     using var canceledSend = new CancellationTokenSource();
     canceledSend.Cancel();
@@ -93,9 +183,74 @@ static async Task TestEventsHeadersCookiesAndConcurrentSendAsync(Uri baseUri)
         client.SendAsync(new byte[] { 99 }, cancellationToken: canceledSend.Token).AsTask());
     Assert(errors.Count == 0, "The echo test must not raise OnError.");
     await client.DisconnectAsync(reason: "echo test complete", cancellationToken: timeout.Token);
+    await closed.Task.WaitAsync(timeout.Token);
     Assert(closeCount == 1, "OnClose must fire exactly once after a graceful disconnect.");
     Assert(closeArgs is { Code: WebSocketCloseStatus.NormalClosure, WasClean: true, WillReconnect: false },
         "OnClose must report a clean manual close without reconnect.");
+}
+
+static async Task TestConcurrentMessageDispatchAsync(Uri baseUri)
+{
+    await using var client = new WebSocketClient(new Uri(baseUri, "/echo"), new WebSocketClientOptions
+    {
+        AutoReconnect = false,
+        ConnectTimeout = TimeSpan.FromSeconds(3)
+    });
+
+    client.SetHeader("X-Test", "header-value");
+    client.SetCookie("session", "cookie-value");
+
+    var releaseHandlers = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var asyncHandlersEntered = 0;
+    var eventHandlersEntered = 0;
+    var asyncHandlersCompleted = 0;
+    var eventHandlersCompleted = 0;
+    var twoAsyncHandlersEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var twoEventHandlersEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var asyncHandlersDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var eventHandlersDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    client.MessageReceivedAsync = async (_, message, type, cancellationToken) =>
+    {
+        Assert(type == WebSocketMessageType.Text, "Concurrent callback must receive a text message.");
+        var textBeforeAwait = Encoding.UTF8.GetString(message.Span);
+        if (Interlocked.Increment(ref asyncHandlersEntered) == 2)
+            twoAsyncHandlersEntered.TrySetResult(true);
+
+        await releaseHandlers.Task.WaitAsync(cancellationToken);
+
+        var textAfterAwait = Encoding.UTF8.GetString(message.Span);
+        Assert(textAfterAwait == textBeforeAwait,
+            "Pooled message memory must remain stable until its concurrent callback completes.");
+        if (Interlocked.Increment(ref asyncHandlersCompleted) == 2)
+            asyncHandlersDone.TrySetResult(true);
+    };
+
+    client.OnMessage += (_, e) =>
+    {
+        var textBeforeWait = e.Text;
+        if (Interlocked.Increment(ref eventHandlersEntered) == 2)
+            twoEventHandlersEntered.TrySetResult(true);
+
+        releaseHandlers.Task.GetAwaiter().GetResult();
+
+        Assert(e.Text == textBeforeWait, "OnMessage must retain a stable copy during concurrent dispatch.");
+        if (Interlocked.Increment(ref eventHandlersCompleted) == 2)
+            eventHandlersDone.TrySetResult(true);
+    };
+
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    await client.ConnectAsync(timeout.Token);
+    await client.SendAsync("concurrent-1", timeout.Token);
+    await client.SendAsync("concurrent-2", timeout.Token);
+
+    await Task.WhenAll(
+        twoAsyncHandlersEntered.Task,
+        twoEventHandlersEntered.Task).WaitAsync(timeout.Token);
+
+    releaseHandlers.TrySetResult(true);
+    await Task.WhenAll(asyncHandlersDone.Task, eventHandlersDone.Task).WaitAsync(timeout.Token);
+    await client.DisconnectAsync(cancellationToken: timeout.Token);
 }
 
 static async Task TestSendErrorHandlerCanDisposeAsync(Uri baseUri)
@@ -104,10 +259,16 @@ static async Task TestSendErrorHandlerCanDisposeAsync(Uri baseUri)
     {
         AutoReconnect = false
     });
-    client.OnError += (_, _) => client.Dispose();
+    var disposed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    client.OnError += (_, _) =>
+    {
+        client.Dispose();
+        disposed.TrySetResult(true);
+    };
 
     await AssertThrowsAsync<InvalidOperationException>(
         client.SendAsync(new byte[] { 1 }).AsTask().WaitAsync(TimeSpan.FromSeconds(1)));
+    await disposed.Task.WaitAsync(TimeSpan.FromSeconds(1));
     Assert(client.State == WebSocketClientState.Disposed,
         "An OnError handler must be able to Dispose without deadlocking on the send gate.");
 }
@@ -125,22 +286,35 @@ static async Task TestAutomaticReconnectAsync(LocalWebSocketServer server)
     var opens = 0;
     var reconnectEvents = 0;
     var errors = 0;
+    var openedTwice = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var reconnectRaised = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var errorRaised = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     Task[]? concurrentConnects = null;
     var message = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-    client.OnOpen += (_, _) => Interlocked.Increment(ref opens);
+    client.OnOpen += (_, _) =>
+    {
+        if (Interlocked.Increment(ref opens) == 2)
+            openedTwice.TrySetResult(true);
+    };
     client.OnReconnecting += (_, _) =>
     {
         Interlocked.Increment(ref reconnectEvents);
         concurrentConnects ??= Enumerable.Range(0, 32)
             .Select(_ => client.ConnectAsync())
             .ToArray();
+        reconnectRaised.TrySetResult(true);
     };
-    client.OnError += (_, _) => Interlocked.Increment(ref errors);
+    client.OnError += (_, _) =>
+    {
+        Interlocked.Increment(ref errors);
+        errorRaised.TrySetResult(true);
+    };
     client.OnMessage += (_, e) => message.TrySetResult(e.Text);
 
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
     await client.ConnectAsync(timeout.Token);
     var text = await message.Task.WaitAsync(timeout.Token);
+    await Task.WhenAll(openedTwice.Task, reconnectRaised.Task, errorRaised.Task).WaitAsync(timeout.Token);
     Assert(concurrentConnects is not null, "The reconnect event must start concurrent ConnectAsync waiters.");
     await Task.WhenAll(concurrentConnects!).WaitAsync(timeout.Token);
 
