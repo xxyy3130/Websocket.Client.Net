@@ -63,7 +63,7 @@ The token passed to `ConnectAsync(cancellationToken)` cancels only the current c
 
 ## Throughput-First Zero-Copy Receiving
 
-To keep data valid after an event handler returns, `OnMessage` creates a stable `byte[]` for each complete message. Throughput-sensitive paths can use `MessageReceivedAsync` instead. The supplied memory comes from a pool and may only be used until the callback completes:
+To keep data valid after an event handler returns, `OnMessage` creates a stable `byte[]` for each complete message. Throughput-sensitive paths can use `MessageReceivedAsync` instead. The supplied memory comes from a pool, remains stable across `await` inside that callback, and may only be used until the callback completes:
 
 ```csharp
 ws.MessageReceivedAsync = async (sender, message, type, cancellationToken) =>
